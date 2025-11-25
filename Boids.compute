@@ -1,0 +1,218 @@
+#pragma kernel CSMain
+#pragma kernel CSCull
+
+struct FlyData
+{
+    float3 position;
+    float3 velocity;
+    float4x4 mat;
+    int state;
+};
+
+struct ObstacleData
+{
+    float3 position;
+    float radius;
+};
+
+RWStructuredBuffer<FlyData> boidDataBuffer;
+StructuredBuffer<ObstacleData> obstacleDataBuffer;
+AppendStructuredBuffer<FlyData> visibleBoidBuffer;
+
+uint boidCount;
+float deltaTime;
+
+float perceptionRadius;
+float separationWeight;
+float alignmentWeight;
+float cohesionWeight;
+
+float3 targetPosition;
+float targetWeight;
+float3 boundsSize;
+float3 boundsCenter;
+float boundsWeight;
+float noiseStrength;
+uint obstacleCount;
+float obstacleAvoidanceWeight;
+float obstacleAvoidanceRadius;
+
+// クリップ空間判定用
+float4x4 viewProjMatrix;
+float frustumMargin;
+
+/// 位置と速度から変換行列を作成
+float4x4 CreateMatrix(float3 pos, float3 vel)
+{
+    float3 forward = normalize(vel);
+    if (any(isnan(forward)))
+        forward = float3(0,0,1);
+    
+    float3 up = float3(0, 1, 0);
+    if (abs(dot(up, forward)) > 0.99)
+        up = float3(0,0,1);
+    
+    float3 right = normalize(cross(up, forward));
+    up = cross(forward, right);
+
+    float4x4 mat = {
+        right.x, up.x, forward.x, pos.x,
+        right.y, up.y, forward.y, pos.y,
+        right.z, up.z, forward.z, pos.z,
+        0,       0,    0,         1
+    };
+
+    float scale = 0.1;
+    mat._11 *= scale; mat._12 *= scale; mat._13 *= scale;
+    mat._21 *= scale; mat._22 *= scale; mat._23 *= scale;
+    mat._31 *= scale; mat._32 *= scale; mat._33 *= scale;
+
+    return mat;
+}
+
+/// 零ベクトルを正規化しないようにする
+float3 SafeNormalize(float3 v)
+{
+    float len = length(v);
+    if (len > 0.0001)
+        return v / len;
+    
+    return float3(0, 0, 0);
+}
+
+/// シンプルな乱数生成関数
+float rand(float2 co)
+{
+    return frac(sin(dot(co.xy, float2(12.9898, 78.233))) * 43758.5453);
+}
+
+/// 3Dノイズを生成
+float3 noise(float3 pos)
+{
+    float x = rand(pos.yz + deltaTime) * 2.0 - 1.0;
+    float y = rand(pos.xz + deltaTime) * 2.0 - 1.0;
+    float z = rand(pos.xy + deltaTime) * 2.0 - 1.0;
+    
+    return SafeNormalize(float3(x, y, z));
+}
+
+[numthreads(64, 1, 1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= boidCount)
+        return;
+
+    // 現在のボイドデータ
+    FlyData currentBoid = boidDataBuffer[id.x];
+
+    // 近傍のボイドに基づく力
+    float3 separationSum = float3(0, 0, 0);
+    float3 alignmentSum = float3(0, 0, 0);
+    float3 cohesionSum = float3(0, 0, 0);
+    int neighborCount = 0;
+
+    // 近傍のボイドを調べる
+    for (uint i = 0 ; i < boidCount ; i++)
+    {
+        if (id.x == i) continue;
+        FlyData otherBoid = boidDataBuffer[i];
+        float dist = distance(currentBoid.position, otherBoid.position);
+        if (dist > 0 && dist < perceptionRadius)
+        {
+            separationSum += normalize(currentBoid.position - otherBoid.position);
+            alignmentSum  += otherBoid.velocity;
+            cohesionSum   += otherBoid.position;
+            neighborCount++;
+        }
+    }
+
+    // フォース計算
+    float3 force = float3(0, 0, 0);
+    if (neighborCount > 0)
+    {
+        alignmentSum /= neighborCount;
+        cohesionSum  /= neighborCount;
+        float3 cohesionForce = SafeNormalize(cohesionSum - currentBoid.position);
+        force += SafeNormalize(separationSum) * separationWeight;
+        force += SafeNormalize(alignmentSum)  * alignmentWeight;
+        force += cohesionForce            * cohesionWeight;
+    }
+
+    // 目標
+    float3 toTarget = targetPosition - currentBoid.position;
+    float lenT = length(toTarget);
+    float3 targetForce = lenT > 0 ? (toTarget / lenT) * targetWeight : float3(0, 0, 0);
+
+    // 境界
+    float3 relPos = currentBoid.position - boundsCenter;
+    float3 halfBounds = boundsSize * 0.5;
+    float3 normPos = relPos / halfBounds;
+    const float threshold = 0.8;
+    float3 boundsForce = float3(0, 0, 0);
+    if (abs(normPos.x) > threshold)
+        boundsForce.x = -normPos.x;
+    if (abs(normPos.y) > threshold)
+        boundsForce.y = -normPos.y;
+    if (abs(normPos.z) > threshold)
+        boundsForce.z = -normPos.z;
+    boundsForce *= boundsWeight;
+
+    // 障害物回避
+    float3 obstacleAvoidanceForce = float3(0, 0, 0);
+    for (uint j = 0 ; j < obstacleCount ; j++)
+    {
+        ObstacleData obs = obstacleDataBuffer[j];
+        float distToObs = distance(currentBoid.position, obs.position);
+        if (distToObs < (obs.radius + obstacleAvoidanceRadius) && distToObs > 0.0001)
+            obstacleAvoidanceForce += SafeNormalize(currentBoid.position - obs.position) / distToObs;
+    }
+    obstacleAvoidanceForce *= obstacleAvoidanceWeight;
+
+    // 状態別係数
+    int st = currentBoid.state;
+    float3 totalForce = force + targetForce + boundsForce + obstacleAvoidanceForce;
+    if (st == 0)          // Wandering
+        totalForce = force + targetForce * 0.5 + boundsForce + obstacleAvoidanceForce;
+    else if (st == 1)     // Seeking
+        totalForce = force + targetForce * 2.0 + boundsForce + obstacleAvoidanceForce;
+    else if (st == 2)     // Fleeing
+        totalForce = force - targetForce + boundsForce + obstacleAvoidanceForce;
+
+    // 速度更新
+    currentBoid.velocity += totalForce * deltaTime;
+    currentBoid.velocity += noise(currentBoid.position) * noiseStrength * deltaTime;
+
+    // 速度制限
+    float speed = length(currentBoid.velocity);
+    const float maxSpeed = 5.0;
+    if (speed > maxSpeed)
+        currentBoid.velocity = (currentBoid.velocity / speed) * maxSpeed;
+
+    // 位置更新
+    currentBoid.position += currentBoid.velocity * deltaTime;
+
+    // 行列更新
+    currentBoid.mat = CreateMatrix(currentBoid.position, currentBoid.velocity);
+
+    // 書き戻し
+    boidDataBuffer[id.x] = currentBoid;
+}
+
+// クリップ空間でのフラスタムカリング
+[numthreads(64,1,1)]
+void CSCull(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= boidCount)
+        return;
+    
+    FlyData b = boidDataBuffer[id.x];
+    float4 clip = mul(viewProjMatrix, float4(b.position, 1));
+    // w が 0 以下は後ろ側
+    if (clip.w <= 0)
+        return;
+    
+    float margin = frustumMargin;
+    bool inside = abs(clip.x) <= clip.w + margin && abs(clip.y) <= clip.w + margin && clip.z >= -margin && clip.z <= clip.w + margin;
+    if (inside)
+        visibleBoidBuffer.Append(b);
+}
