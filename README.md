@@ -1,1 +1,4 @@
 # BoidAlgorithmForUnity
+
+サークルの開発で使用した、Boidアルゴリズムを用いたハエの動きシミュレーターです。
+.unitypackageインポートでそのまま使えるはずです。
